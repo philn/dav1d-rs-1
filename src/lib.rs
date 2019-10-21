@@ -7,30 +7,86 @@ use std::ptr;
 use std::sync::Arc;
 
 #[derive(Debug)]
+pub struct PictureAllocator {
+    sys_allocator: Dav1dPicAllocator,
+}
+
+pub trait PictureAllocatorInterface {
+    fn alloc_picture(&self, _pic: &mut Picture) -> Result<(), i32> {
+        Ok(())
+    }
+    fn release_picture(&self, _picture: Picture) {}
+}
+
+extern "C" fn alloc_picture_callback(pic: *mut Dav1dPicture, cookie: *mut c_void) -> i32 {
+    let interface: Box<Box<dyn PictureAllocatorInterface>> = unsafe { Box::from_raw(cookie as _) };
+    let mut picture = unsafe {
+        Picture {
+            pic: Arc::new(*pic),
+        }
+    };
+    match interface.alloc_picture(&mut picture) {
+        Ok(_) => 0,
+        Err(e) => e,
+    }
+}
+
+extern "C" fn release_picture_callback(pic: *mut Dav1dPicture, cookie: *mut c_void) {
+    let interface: Box<Box<dyn PictureAllocatorInterface>> = unsafe { Box::from_raw(cookie as _) };
+    let picture = unsafe {
+        Picture {
+            pic: Arc::new(*pic),
+        }
+    };
+    interface.release_picture(picture);
+}
+
+impl PictureAllocator {
+    pub fn new(interface: Box<dyn PictureAllocatorInterface>) -> Self {
+        unsafe {
+            let allocator = mem::MaybeUninit::uninit();
+            let mut allocator: Dav1dPicAllocator = allocator.assume_init();
+
+            allocator.cookie = Box::into_raw(Box::new(interface)) as *mut c_void;
+            allocator.alloc_picture_callback = Some(alloc_picture_callback);
+            allocator.release_picture_callback = Some(release_picture_callback);
+            Self {
+                sys_allocator: allocator,
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Decoder {
     dec: *mut Dav1dContext,
 }
 
-unsafe extern "C" fn release_wrapped_data(_data: *const u8, cookie: *mut c_void) {
-    let closure: &mut &mut dyn FnMut() = &mut *(cookie as *mut &mut dyn std::ops::FnMut());
+extern "C" fn release_wrapped_data(_data: *const u8, cookie: *mut c_void) {
+    let closure: &mut &mut dyn FnMut() =
+        unsafe { &mut *(cookie as *mut &mut dyn std::ops::FnMut()) };
     closure();
 }
 
 impl Default for Decoder {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
 impl Decoder {
-    pub fn new() -> Self {
+    pub fn new(allocator_interface: Option<Box<dyn PictureAllocatorInterface>>) -> Self {
         unsafe {
             let mut settings = mem::MaybeUninit::uninit();
             let mut dec = mem::MaybeUninit::uninit();
 
             dav1d_default_settings(settings.as_mut_ptr());
 
-            let settings = settings.assume_init();
+            let mut settings = settings.assume_init();
+            if let Some(allocator_interface) = allocator_interface {
+                let allocator = PictureAllocator::new(allocator_interface);
+                settings.allocator = allocator.sys_allocator;
+            }
 
             let ret = dav1d_open(dec.as_mut_ptr(), &settings);
 
@@ -38,7 +94,9 @@ impl Decoder {
                 panic!("Cannot instantiate the default decoder {}", ret);
             }
 
-            Decoder { dec: dec.assume_init() }
+            Decoder {
+                dec: dec.assume_init(),
+            }
         }
     }
 
